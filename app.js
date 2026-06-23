@@ -4,7 +4,7 @@ const cors = require('cors');
 const mongoose = require('mongoose');
 const connectDB = require('./config/db');
 const { notFound, errorHandler } = require('./middleware/errorHandler');
-const { scanAndReassignTimeoutOrders } = require('./controllers/orderController');
+const { scanAndReassignTimeoutOrders } = require('./services/timeoutService');
 
 const orderRoutes = require('./routes/orders');
 const riderRoutes = require('./routes/riders');
