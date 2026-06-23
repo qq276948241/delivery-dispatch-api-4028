@@ -1,6 +1,7 @@
 const Order = require('../models/Order');
 const { reassignOrderToPool } = require('./orderService');
 const { addTimeoutMark } = require('./riderService');
+const { ConcurrencyError } = require('../utils/errors');
 
 const DEFAULT_BATCH_SIZE = 50;
 const LOG_PREFIX = '[TimeoutScanner]';
@@ -35,6 +36,7 @@ const processOneTimeoutOrder = async (order, now) => {
 const scanAndReassignTimeoutOrders = async () => {
   const now = new Date();
   const reassigned = [];
+  const skipped = [];
   let hasMore = true;
   let skip = 0;
 
@@ -50,6 +52,14 @@ const scanAndReassignTimeoutOrders = async () => {
         const result = await processOneTimeoutOrder(order, now);
         reassigned.push(result);
       } catch (err) {
+        if (err instanceof ConcurrencyError) {
+          skipped.push({
+            orderId: order._id,
+            orderNo: order.orderNo,
+            reason: 'CONCURRENT_MODIFICATION',
+          });
+          continue;
+        }
         console.error(`${LOG_PREFIX} 订单 ${order._id} 改派失败:`, err.message);
       }
     }
@@ -61,11 +71,16 @@ const scanAndReassignTimeoutOrders = async () => {
   const result = {
     scannedAt: now,
     totalReassigned: reassigned.length,
+    totalSkipped: skipped.length,
     reassigned,
+    skipped,
   };
 
-  if (reassigned.length > 0) {
-    console.log(`${LOG_PREFIX} ${now.toISOString()} 改派 ${reassigned.length} 笔超时订单`);
+  if (reassigned.length > 0 || skipped.length > 0) {
+    console.log(
+      `${LOG_PREFIX} ${now.toISOString()} 改派 ${reassigned.length} 笔，` +
+      `跳过 ${skipped.length} 笔（并发冲突）`
+    );
   }
 
   return result;

@@ -2,7 +2,17 @@ const Order = require('../models/Order');
 const Zone = require('../models/Zone');
 const Rider = require('../models/Rider');
 const { generateOrderNo, calculateDistance, calculateDeliveryFee } = require('../utils/helpers');
-const { validateRiderCanAccept, ensureTodayStats } = require('./riderService');
+const {
+  validateRiderCanAccept,
+  ensureTodayStats,
+} = require('./riderService');
+const {
+  updateWithOptimisticLock,
+  ConcurrencyError,
+  ForbiddenError,
+  ValidationError,
+  NotFoundError,
+} = require('../utils/errors');
 
 const VALID_TRANSITIONS = {
   accepted: ['delivering', 'cancelled'],
@@ -26,7 +36,10 @@ const findZoneForPoint = async (coordinates) => {
 
 const createOrder = async (payload) => {
   const { merchant, customer, items, orderAmount } = payload;
-  const distance = calculateDistance(merchant.location.coordinates, customer.location.coordinates);
+  const distance = calculateDistance(
+    merchant.location.coordinates,
+    customer.location.coordinates
+  );
   const deliveryFee = calculateDeliveryFee(distance);
   const zone = await findZoneForPoint(merchant.location.coordinates);
 
@@ -79,12 +92,12 @@ const getOrdersByRider = async (riderId, status) => {
   return Order.find(query).sort({ createdAt: -1 }).limit(100);
 };
 
-const validateOrderAcceptableForRider = async (order, rider) => {
+const validateOrderAcceptableForRider = (order, rider) => {
   if (!order) {
-    return { ok: false, status: 404, message: '订单不存在' };
+    return { ok: false, error: new NotFoundError('订单不存在') };
   }
   if (order.status !== 'pending') {
-    return { ok: false, status: 400, message: '订单已被接取或已取消' };
+    return { ok: false, error: new ValidationError('订单已被接取或已取消') };
   }
   if (
     order.previousRiders &&
@@ -94,8 +107,7 @@ const validateOrderAcceptableForRider = async (order, rider) => {
   ) {
     return {
       ok: false,
-      status: 400,
-      message: '该订单此前已被此骑手超时释放，无法再次接取',
+      error: new ValidationError('该订单此前已被此骑手超时释放，无法再次接取'),
     };
   }
   return { ok: true };
@@ -106,13 +118,25 @@ const acceptOrderForRider = async (orderId, rider) => {
   if (!riderCheck.ok) return riderCheck;
 
   const order = await getOrderById(orderId, false);
-  const orderCheck = await validateOrderAcceptableForRider(order, rider);
-  if (!orderCheck.ok) return orderCheck;
+  const orderCheck = validateOrderAcceptableForRider(order, rider);
+  if (!orderCheck.ok) {
+    return { ok: false, status: orderCheck.error.statusCode, message: orderCheck.error.message };
+  }
 
-  order.status = 'accepted';
-  order.rider = rider._id;
-  order.acceptedAt = new Date();
-  await order.save();
+  const now = new Date();
+  const updateData = {
+    status: 'accepted',
+    rider: rider._id,
+    acceptedAt: now,
+  };
+
+  const updatedOrder = await updateWithOptimisticLock(
+    Order,
+    orderId,
+    order.__v,
+    updateData,
+    { status: 'pending' }
+  );
 
   await Rider.updateOne(
     { _id: rider._id, 'todayStats.date': new Date().setHours(0, 0, 0, 0) },
@@ -121,7 +145,7 @@ const acceptOrderForRider = async (orderId, rider) => {
   );
   await ensureTodayStats(rider._id);
 
-  return { ok: true, data: order };
+  return { ok: true, data: updatedOrder };
 };
 
 const validateStatusTransition = (from, to) => {
@@ -144,74 +168,102 @@ const calculateTimeoutDeduction = (order, deliveredAt) => {
 const updateOrderStatusForRider = async (orderId, rider, newStatus, extra = {}) => {
   const order = await getOrderById(orderId, false);
   if (!order) {
-    return { ok: false, status: 404, message: '订单不存在' };
+    throw new NotFoundError('订单不存在');
   }
 
   if (order.rider && order.rider.toString() !== rider._id.toString()) {
-    return { ok: false, status: 403, message: '无权操作此订单' };
+    throw new ForbiddenError('无权操作此订单');
   }
 
   if (!validateStatusTransition(order.status, newStatus)) {
-    return {
-      ok: false,
-      status: 400,
-      message: `无法从 ${order.status} 流转到 ${newStatus}`,
-    };
+    throw new ValidationError(`无法从 ${order.status} 流转到 ${newStatus}`);
   }
 
-  order.status = newStatus;
   const now = new Date();
+  const updateData = { status: newStatus };
 
   if (newStatus === 'delivering') {
-    order.pickedUpAt = now;
+    updateData.pickedUpAt = now;
   }
 
+  let timeoutDeduction = 0;
   if (newStatus === 'delivered') {
-    order.deliveredAt = now;
-    order.timeoutDeduction = calculateTimeoutDeduction(order, now);
-    const actualEarnings = order.deliveryFee - order.timeoutDeduction;
+    updateData.deliveredAt = now;
+    timeoutDeduction = calculateTimeoutDeduction(order, now);
+    updateData.timeoutDeduction = timeoutDeduction;
+  }
+
+  if (newStatus === 'cancelled') {
+    updateData.cancelledAt = now;
+    updateData.cancelReason = extra.reason || '骑手取消';
+  }
+
+  const updatedOrder = await updateWithOptimisticLock(
+    Order,
+    orderId,
+    order.__v,
+    updateData,
+    { status: order.status }
+  );
+
+  if (newStatus === 'delivered') {
+    const actualEarnings = updatedOrder.deliveryFee - (updatedOrder.timeoutDeduction || 0);
     await Rider.updateOne(
       { _id: rider._id },
       {
         $inc: {
           'todayStats.ordersDelivered': 1,
-          'todayStats.totalDistance': order.distance,
+          'todayStats.totalDistance': updatedOrder.distance,
           'todayStats.totalEarnings': actualEarnings,
         },
       }
     );
   }
 
-  if (newStatus === 'cancelled') {
-    order.cancelledAt = now;
-    order.cancelReason = extra.reason || '骑手取消';
-  }
-
-  await order.save();
-  return { ok: true, data: order };
+  return { ok: true, data: updatedOrder };
 };
 
 const reassignOrderToPool = async (order, timeoutMinutes, now = new Date()) => {
   const riderId = order.rider && order.rider._id ? order.rider._id : order.rider;
 
-  order.status = 'pending';
-  order.previousRiders = order.previousRiders || [];
-  order.previousRiders.push({
+  if (!order.status || !['accepted', 'delivering'].includes(order.status)) {
+    throw new ValidationError(`订单状态为 ${order.status}，无法改派`);
+  }
+
+  const historyEntry = {
     rider: riderId,
     acceptedAt: order.acceptedAt,
     pickedUpAt: order.pickedUpAt,
     releasedAt: now,
     releaseReason: 'timeout_auto_reassign',
     timeoutMinutes,
-  });
-  order.rider = null;
-  order.acceptedAt = null;
-  order.pickedUpAt = null;
-  order.reassignCount = (order.reassignCount || 0) + 1;
-  order.promisedDeliveryTime = new Date(now.getTime() + REASSIGN_PROMISED_MINUTES * 60 * 1000);
+  };
 
-  await order.save();
-  return order;
+  const updateData = {
+    status: 'pending',
+    rider: null,
+    acceptedAt: null,
+    pickedUpAt: null,
+    reassignCount: (order.reassignCount || 0) + 1,
+    promisedDeliveryTime: new Date(now.getTime() + REASSIGN_PROMISED_MINUTES * 60 * 1000),
+  };
+
+  const updatedOrder = await updateWithOptimisticLock(
+    Order,
+    order._id,
+    order.__v,
+    updateData,
+    { status: order.status },
+    {
+      arrayPush: {
+        previousRiders: {
+          $each: [historyEntry],
+        },
+      },
+    }
+  );
+
+  return updatedOrder;
 };
 
 module.exports = {

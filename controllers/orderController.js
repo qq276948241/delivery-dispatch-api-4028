@@ -41,6 +41,13 @@ const acceptOrder = async (req, res) => {
     }
     res.json(result.data);
   } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        message: error.message,
+        error: error.name,
+        ...(error.meta && { meta: error.meta }),
+      });
+    }
     res.status(500).json({ message: error.message });
   }
 };
@@ -53,11 +60,15 @@ const updateOrderStatus = async (req, res) => {
       return res.status(400).json({ message: '请提供目标状态 status' });
     }
     const result = await updateOrderStatusForRider(orderId, req.rider, status, { reason });
-    if (!result.ok) {
-      return res.status(result.status).json({ message: result.message });
-    }
     res.json(result.data);
   } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        message: error.message,
+        error: error.name,
+        ...(error.meta && { meta: error.meta }),
+      });
+    }
     res.status(500).json({ message: error.message });
   }
 };

@@ -117,10 +117,13 @@ const orderSchema = new mongoose.Schema({
   ],
 }, {
   timestamps: true,
+  versionKey: '__v',
 });
 
 orderSchema.index({ 'merchant.location': '2dsphere' });
 orderSchema.index({ 'customer.location': '2dsphere' });
 orderSchema.index({ status: 1, createdAt: -1 });
+orderSchema.index({ status: 1, __v: 1 });
+orderSchema.index({ rider: 1, status: 1 });
 
 module.exports = mongoose.model('Order', orderSchema);
