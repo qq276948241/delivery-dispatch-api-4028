@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { auth } = require('../middleware/auth');
+const { auth, stationMasterAuth } = require('../middleware/auth');
 const {
   register,
   login,
@@ -10,6 +10,9 @@ const {
   getMyProfile,
   getTodayStats,
   getNearbyRiders,
+  getMyTimeoutHistory,
+  recordTimeout,
+  clearTimeoutHistory,
 } = require('../controllers/riderController');
 
 router.post('/register', register);
@@ -19,6 +22,9 @@ router.post('/offline', auth, goOffline);
 router.post('/location', auth, updateLocation);
 router.get('/me', auth, getMyProfile);
 router.get('/stats/today', auth, getTodayStats);
+router.get('/timeouts/me', auth, getMyTimeoutHistory);
+router.post('/timeouts/record', auth, stationMasterAuth, recordTimeout);
+router.post('/timeouts/clear/:riderId?', auth, clearTimeoutHistory);
 router.get('/nearby', getNearbyRiders);
 
 module.exports = router;

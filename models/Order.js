@@ -92,6 +92,29 @@ const orderSchema = new mongoose.Schema({
     type: Number,
     default: 0,
   },
+  reassignCount: {
+    type: Number,
+    default: 0,
+  },
+  previousRiders: [
+    {
+      rider: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Rider',
+      },
+      acceptedAt: Date,
+      pickedUpAt: Date,
+      releasedAt: {
+        type: Date,
+        default: Date.now,
+      },
+      releaseReason: {
+        type: String,
+        enum: ['timeout_auto_reassign', 'manual_cancel', 'other'],
+      },
+      timeoutMinutes: Number,
+    },
+  ],
 }, {
   timestamps: true,
 });

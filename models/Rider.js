@@ -75,12 +75,58 @@ const riderSchema = new mongoose.Schema({
       type: Number,
       default: 0,
     },
+    timeoutsCount: {
+      type: Number,
+      default: 0,
+    },
+  },
+  dispatchPriority: {
+    type: Number,
+    default: 100,
+    min: 0,
+    max: 100,
+  },
+  timeoutHistory: [
+    {
+      orderId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Order',
+        required: true,
+      },
+      timeoutAt: {
+        type: Date,
+        default: Date.now,
+      },
+      timeoutMinutes: {
+        type: Number,
+        required: true,
+      },
+      autoReassigned: {
+        type: Boolean,
+        default: true,
+      },
+      expired: {
+        type: Boolean,
+        default: false,
+      },
+    },
+  ],
+  lastTimeoutAt: {
+    type: Date,
+  },
+  cooldownUntil: {
+    type: Date,
   },
 }, {
   timestamps: true,
 });
 
 riderSchema.index({ location: '2dsphere' });
+riderSchema.index({ dispatchPriority: -1 });
+
+riderSchema.virtual('isInCooldown').get(function () {
+  return this.cooldownUntil && this.cooldownUntil > new Date();
+});
 
 riderSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();

@@ -1,6 +1,7 @@
 const jwt = require('jsonwebtoken');
 const Rider = require('../models/Rider');
 const Order = require('../models/Order');
+const { addTimeoutMarkToRider } = require('./orderController');
 
 const register = async (req, res) => {
   try {
@@ -206,10 +207,112 @@ const getNearbyRiders = async (req, res) => {
     }
 
     const riders = await Rider.find(query)
-      .select('-password -todayStats')
+      .select('-password -todayStats -timeoutHistory')
+      .sort({ dispatchPriority: -1, lastLocationUpdate: -1 })
       .limit(30);
 
     res.json(riders);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+const getMyTimeoutHistory = async (req, res) => {
+  try {
+    const { limit = 50, days = 30 } = req.query;
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - parseInt(days));
+
+    const rider = await Rider.findById(req.rider._id);
+    if (!rider) {
+      return res.status(404).json({ message: '骑手不存在' });
+    }
+
+    const history = (rider.timeoutHistory || [])
+      .filter((t) => new Date(t.timeoutAt) >= cutoffDate)
+      .sort((a, b) => new Date(b.timeoutAt) - new Date(a.timeoutAt))
+      .slice(0, parseInt(limit));
+
+    const stats = {
+      totalTimeouts: (rider.timeoutHistory || []).filter(
+        (t) => new Date(t.timeoutAt) >= cutoffDate
+      ).length,
+      dispatchPriority: rider.dispatchPriority,
+      cooldownUntil: rider.cooldownUntil || null,
+      isInCooldown: rider.cooldownUntil && new Date(rider.cooldownUntil) > new Date(),
+      lastTimeoutAt: rider.lastTimeoutAt || null,
+      todayTimeoutsCount: (rider.todayStats && rider.todayStats.date.toDateString() === new Date().toDateString())
+        ? (rider.todayStats.timeoutsCount || 0)
+        : 0,
+    };
+
+    res.json({ stats, history });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+const recordTimeout = async (req, res) => {
+  try {
+    const { riderId, orderId, timeoutMinutes, autoReassigned = false } = req.body;
+
+    if (!riderId || !orderId || !timeoutMinutes) {
+      return res.status(400).json({ message: '缺少必要字段：riderId、orderId、timeoutMinutes' });
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) {
+      return res.status(404).json({ message: '订单不存在' });
+    }
+
+    const rider = await addTimeoutMarkToRider(riderId, orderId, timeoutMinutes, autoReassigned);
+    if (!rider) {
+      return res.status(404).json({ message: '骑手不存在' });
+    }
+
+    rider.password = undefined;
+    res.json({
+      message: '超时标记已记录',
+      dispatchPriority: rider.dispatchPriority,
+      cooldownUntil: rider.cooldownUntil,
+      timeoutsCount24h: rider.timeoutHistory.filter(
+        (t) => !t.expired && Date.now() - new Date(t.timeoutAt).getTime() < 24 * 60 * 60 * 1000
+      ).length,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+const clearTimeoutHistory = async (req, res) => {
+  try {
+    const { riderId } = req.params;
+    const targetRiderId = riderId || req.rider._id;
+
+    const rider = await Rider.findById(targetRiderId);
+    if (!rider) {
+      return res.status(404).json({ message: '骑手不存在' });
+    }
+
+    if (
+      targetRiderId.toString() !== req.rider._id.toString() &&
+      !req.rider.isStationMaster
+    ) {
+      return res.status(403).json({ message: '仅站长可清除他人超时记录' });
+    }
+
+    rider.timeoutHistory = [];
+    rider.dispatchPriority = 100;
+    rider.cooldownUntil = null;
+    rider.lastTimeoutAt = null;
+    if (rider.todayStats) {
+      rider.todayStats.timeoutsCount = 0;
+    }
+
+    await rider.save();
+    rider.password = undefined;
+
+    res.json({ message: '超时记录已清除，优先级已恢复', rider });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -224,4 +327,7 @@ module.exports = {
   getMyProfile,
   getTodayStats,
   getNearbyRiders,
+  getMyTimeoutHistory,
+  recordTimeout,
+  clearTimeoutHistory,
 };

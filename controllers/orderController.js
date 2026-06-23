@@ -3,6 +3,115 @@ const Zone = require('../models/Zone');
 const Rider = require('../models/Rider');
 const { generateOrderNo, calculateDistance, calculateDeliveryFee } = require('../utils/helpers');
 
+const addTimeoutMarkToRider = async (riderId, orderId, timeoutMinutes, autoReassigned = true) => {
+  const penaltyPerTimeout = 10;
+  const cooldownMinutesPerTimeout = 15;
+  const now = new Date();
+
+  const rider = await Rider.findById(riderId);
+  if (!rider) return null;
+
+  const timeoutRecord = {
+    orderId,
+    timeoutAt: now,
+    timeoutMinutes,
+    autoReassigned,
+    expired: false,
+  };
+
+  rider.timeoutHistory.push(timeoutRecord);
+  rider.lastTimeoutAt = now;
+
+  const recentTimeouts = rider.timeoutHistory.filter(
+    (t) => !t.expired && now - new Date(t.timeoutAt) < 24 * 60 * 60 * 1000
+  ).length;
+
+  rider.todayStats.timeoutsCount = (rider.todayStats.timeoutsCount || 0) + 1;
+  rider.dispatchPriority = Math.max(0, 100 - recentTimeouts * penaltyPerTimeout);
+
+  const totalCooldown = recentTimeouts * cooldownMinutesPerTimeout;
+  rider.cooldownUntil = new Date(now.getTime() + totalCooldown * 60 * 1000);
+
+  await rider.save();
+  return rider;
+};
+
+const scanAndReassignTimeoutOrders = async () => {
+  const now = new Date();
+  const batchSize = 50;
+  const reassigned = [];
+  let hasMore = true;
+  let skip = 0;
+
+  while (hasMore) {
+    const timeoutOrders = await Order.find({
+      status: { $in: ['accepted', 'delivering'] },
+      promisedDeliveryTime: { $lt: now },
+      rider: { $exists: true, $ne: null },
+    })
+      .populate('rider', '_id')
+      .skip(skip)
+      .limit(batchSize);
+
+    if (timeoutOrders.length === 0) {
+      hasMore = false;
+      break;
+    }
+
+    for (const order of timeoutOrders) {
+      try {
+        const timeoutMinutes = Math.ceil((now - new Date(order.promisedDeliveryTime)) / (1000 * 60));
+        const riderId = order.rider._id || order.rider;
+
+        order.status = 'pending';
+        order.previousRiders = order.previousRiders || [];
+        order.previousRiders.push({
+          rider: riderId,
+          acceptedAt: order.acceptedAt,
+          pickedUpAt: order.pickedUpAt,
+          releasedAt: now,
+          releaseReason: 'timeout_auto_reassign',
+          timeoutMinutes,
+        });
+        order.rider = null;
+        order.acceptedAt = null;
+        order.pickedUpAt = null;
+        order.reassignCount = (order.reassignCount || 0) + 1;
+        order.promisedDeliveryTime = new Date(now.getTime() + 30 * 60 * 1000);
+
+        await order.save();
+
+        await addTimeoutMarkToRider(riderId, order._id, timeoutMinutes, true);
+        reassigned.push({ orderId: order._id, orderNo: order.orderNo, timeoutMinutes });
+      } catch (err) {
+        console.error(`[Reassign] 订单 ${order._id} 改派失败:`, err.message);
+      }
+    }
+
+    skip += batchSize;
+    if (timeoutOrders.length < batchSize) hasMore = false;
+  }
+
+  const result = {
+    scannedAt: now,
+    totalReassigned: reassigned.length,
+    reassigned,
+  };
+  if (reassigned.length > 0) {
+    console.log(`[TimeoutScanner] ${now.toISOString()} 改派 ${reassigned.length} 笔超时订单`);
+  }
+  return result;
+};
+
+const triggerTimeoutScan = async (req, res) => {
+  try {
+    const result = await scanAndReassignTimeoutOrders();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
 const createOrder = async (req, res) => {
   try {
     const { merchant, customer, items, orderAmount } = req.body;
@@ -84,6 +193,23 @@ const acceptOrder = async (req, res) => {
       return res.status(400).json({ message: '骑手未上线，无法接单' });
     }
 
+    const now = new Date();
+    if (rider.cooldownUntil && new Date(rider.cooldownUntil) > now) {
+      const remainingMinutes = Math.ceil((new Date(rider.cooldownUntil) - now) / (1000 * 60));
+      return res.status(403).json({
+        message: `骑手处于超时冷却期，剩余 ${remainingMinutes} 分钟后可接单`,
+        cooldownUntil: rider.cooldownUntil,
+        remainingMinutes,
+      });
+    }
+
+    if (rider.dispatchPriority < 20) {
+      return res.status(403).json({
+        message: '骑手优先级过低，暂无法接单，请联系站长处理',
+        dispatchPriority: rider.dispatchPriority,
+      });
+    }
+
     const order = await Order.findById(orderId);
     if (!order) {
       return res.status(404).json({ message: '订单不存在' });
@@ -91,6 +217,26 @@ const acceptOrder = async (req, res) => {
 
     if (order.status !== 'pending') {
       return res.status(400).json({ message: '订单已被接取或已取消' });
+    }
+
+    if (order.previousRiders && order.previousRiders.some(
+      (p) => p.rider && p.rider.toString() === rider._id.toString()
+    )) {
+      return res.status(400).json({ message: '该订单此前已被此骑手超时释放，无法再次接取' });
+    }
+
+    const deliveringCount = await Order.countDocuments({
+      rider: rider._id,
+      status: { $in: ['accepted', 'delivering'] },
+    });
+
+    const maxConcurrent = rider.dispatchPriority >= 80 ? 6 : rider.dispatchPriority >= 50 ? 4 : 2;
+    if (deliveringCount >= maxConcurrent) {
+      return res.status(400).json({
+        message: `同时配送订单数已达上限（${maxConcurrent}），请先完成已有订单`,
+        currentCount: deliveringCount,
+        maxConcurrent,
+      });
     }
 
     order.status = 'accepted';
@@ -113,6 +259,7 @@ const acceptOrder = async (req, res) => {
         ordersDelivered: 0,
         totalDistance: 0,
         totalEarnings: 0,
+        timeoutsCount: 0,
       };
       await updatedRider.save();
     }
@@ -224,4 +371,7 @@ module.exports = {
   updateOrderStatus,
   getOrderDetail,
   getMyOrders,
+  scanAndReassignTimeoutOrders,
+  triggerTimeoutScan,
+  addTimeoutMarkToRider,
 };
